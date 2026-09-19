@@ -1,144 +1,230 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <winsock2.h>
-#include <windows.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/time.h>
 
-#pragma comment(lib, "ws2_32.lib")
+#define PORT 9000
+#define MAX_MSG_SIZE 100
+#define ACK "OK"
 
-#define PORT 8080
-#define TIMEOUT 2000
+struct Frame
+{
+    int seqNo;
+    char data[MAX_MSG_SIZE];
+};
+
+struct Acknowledgement
+{
+    int seqNo;
+    char status[3];
+};
+
+long long currentTimeMs()
+{
+    struct timeval now;
+
+    gettimeofday(&now, NULL);
+    return (now.tv_sec * 1000LL) + (now.tv_usec / 1000);
+}
+
+double elapsedSeconds(long long startTime)
+{
+    return (currentTimeMs() - startTime) / 1000.0;
+}
+
+static void trimNewline(char *text)
+{
+    size_t length = strlen(text);
+
+    while (length > 0 && (text[length - 1] == '\n' || text[length - 1] == '\r'))
+    {
+        text[length - 1] = '\0';
+        length--;
+    }
+}
 
 int main()
 {
-    WSADATA wsa;
-    SOCKET clientSocket;
-    struct sockaddr_in server;
-    int serverLen = sizeof(server);
+    int clientSocket;
+    struct sockaddr_in serverAddress;
+    long long startTime;
 
-    int totalFrames;
-    int frame;
-    int ack;
-
-    srand((unsigned int)time(NULL));
-
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-
-    clientSocket = socket(AF_INET, SOCK_DGRAM, 0);
-
-    server.sin_family = AF_INET;
-    server.sin_port = htons(PORT);
-    server.sin_addr.s_addr = inet_addr("127.0.0.1");
-
+    clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (clientSocket < 0)
     {
-        DWORD timeout = TIMEOUT;
-
-        setsockopt(
-            clientSocket,
-            SOL_SOCKET,
-            SO_RCVTIMEO,
-            (char *)&timeout,
-            sizeof(timeout)
-        );
+        printf("Socket creation failed.\n");
+        return 1;
     }
 
-    printf("Stop and Wait ARQ\n\n");
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(PORT);
+
+    if (inet_pton(AF_INET, "127.0.0.1", &serverAddress.sin_addr) <= 0)
+    {
+        printf("Invalid server address.\n");
+        close(clientSocket);
+        return 1;
+    }
+
+    startTime = currentTimeMs();
+
+    printf("=================================\n");
+    printf(" STOP-AND-WAIT NOISY CLIENT\n");
+    printf("=================================\n");
+
+    if (connect(clientSocket, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) < 0)
+    {
+        printf("[%.3fs] Connection failed.\n", elapsedSeconds(startTime));
+        close(clientSocket);
+        return 1;
+    }
+
+    printf("[%.3fs] Connection established.\n", elapsedSeconds(startTime));
+
+    int frameCount;
+    int timeoutSeconds;
 
     printf("Enter number of frames: ");
-    scanf("%d", &totalFrames);
+    scanf("%d", &frameCount);
+    getchar();
 
-    printf("\n");
+    printf("Enter acknowledgement timeout in seconds: ");
+    scanf("%d", &timeoutSeconds);
+    getchar();
 
-    for (frame = 0; frame < totalFrames; frame++)
+    if (frameCount <= 0 || timeoutSeconds <= 0)
     {
-        int acknowledged = 0;
-        int firstTry = 1;
+        printf("[%.3fs] Invalid input.\n", elapsedSeconds(startTime));
+        close(clientSocket);
+        return 1;
+    }
+
+    send(clientSocket, &frameCount, sizeof(frameCount), 0);
+
+    for (int i = 0; i < frameCount; i++)
+    {
+        struct Frame frame;
+        struct Acknowledgement ack;
+        bool acknowledged = false;
+        int simulateLoss = 0;
+
+        memset(&frame, 0, sizeof(frame));
+        frame.seqNo = i;
+
+        printf("Enter message for frame %d: ", i + 1);
+        if (fgets(frame.data, MAX_MSG_SIZE, stdin) == NULL)
+        {
+            snprintf(frame.data, MAX_MSG_SIZE, "Frame-%d", i + 1);
+        }
+        trimNewline(frame.data);
+
+        printf("Simulate data-frame loss for frame %d? (1 = yes, 0 = no): ", i + 1);
+        scanf("%d", &simulateLoss);
+        getchar();
 
         while (!acknowledged)
         {
-            DWORD start;
-            DWORD end;
-            DWORD timeTaken;
+            printf(
+                "[%.3fs] Sender sends Frame %d: %s\n",
+                elapsedSeconds(startTime),
+                i + 1,
+                frame.data
+            );
 
-            printf("Sending %d\n", frame);
-
-            start = GetTickCount();
-
-            if (firstTry && (rand() % 100) < 30)
+            if (simulateLoss)
             {
-                printf("Frame %d lost\n", frame);
+                printf(
+                    "[%.3fs] Channel drops Frame %d; sender waits for ACK until timeout\n",
+                    elapsedSeconds(startTime),
+                    i + 1
+                );
+                simulateLoss = 0;
+            }
+            else
+            {
+                send(clientSocket, &frame, sizeof(frame), 0);
+            }
 
-                firstTry = 0;
+            fd_set readSet;
+            struct timeval timeout;
 
-                Sleep(TIMEOUT);
+            FD_ZERO(&readSet);
+            FD_SET(clientSocket, &readSet);
 
-                end = GetTickCount();
-                timeTaken = end - start;
+            timeout.tv_sec = timeoutSeconds;
+            timeout.tv_usec = 0;
 
-                printf("Timeout after %lu ms\n",
-                       (unsigned long)timeTaken);
+            int activity = select(clientSocket + 1, &readSet, NULL, NULL, &timeout);
 
-                printf("Sending %d again\n\n", frame);
+            if (activity < 0)
+            {
+                perror("Error while waiting for acknowledgement");
+                close(clientSocket);
+                return 1;
+            }
 
+            if (activity == 0)
+            {
+                printf(
+                    "[%.3fs] TIMEOUT: ACK for Frame %d not received in %d second(s)\n",
+                    elapsedSeconds(startTime),
+                    i + 1,
+                    timeoutSeconds
+                );
+                printf(
+                    "[%.3fs] Stop-and-Wait retransmits Frame %d\n\n",
+                    elapsedSeconds(startTime),
+                    i + 1
+                );
                 continue;
             }
 
-            firstTry = 0;
-
-            sendto(
-                clientSocket,
-                (char *)&frame,
-                sizeof(frame),
-                0,
-                (struct sockaddr *)&server,
-                sizeof(server)
-            );
-
+            int received = recv(clientSocket, &ack, sizeof(ack), 0);
+            if (received <= 0)
             {
-                int bytes = recvfrom(
-                    clientSocket,
-                    (char *)&ack,
-                    sizeof(ack),
-                    0,
-                    (struct sockaddr *)&server,
-                    &serverLen
+                printf("[%.3fs] Connection closed before ACK was received.\n", elapsedSeconds(startTime));
+                close(clientSocket);
+                return 1;
+            }
+
+            if (ack.seqNo == frame.seqNo && strcmp(ack.status, ACK) == 0)
+            {
+                acknowledged = true;
+                printf(
+                    "[%.3fs] ACK received for Frame %d; sender moves to next frame\n\n",
+                    elapsedSeconds(startTime),
+                    i + 1
                 );
-
-                end = GetTickCount();
-                timeTaken = end - start;
-
-                if (bytes != SOCKET_ERROR && ack == frame)
-                {
-                    printf("ACK %d received\n", ack);
-                    printf("Time: %lu ms\n\n",
-                           (unsigned long)timeTaken);
-
-                    acknowledged = 1;
-                }
-                else
-                {
-                    printf("Timeout\n");
-                    printf("Sending %d again\n\n", frame);
-                }
+            }
+            else
+            {
+                printf(
+                    "[%.3fs] Invalid ACK received for Frame %d; retransmitting\n\n",
+                    elapsedSeconds(startTime),
+                    i + 1
+                );
             }
         }
     }
 
-    frame = -1;
+    {
+        struct Frame endFrame;
 
-    sendto(
-        clientSocket,
-        (char *)&frame,
-        sizeof(frame),
-        0,
-        (struct sockaddr *)&server,
-        sizeof(server)
+        memset(&endFrame, 0, sizeof(endFrame));
+        endFrame.seqNo = -1;
+        send(clientSocket, &endFrame, sizeof(endFrame), 0);
+    }
+
+    printf(
+        "[%.3fs] All frames transmitted successfully.\n",
+        elapsedSeconds(startTime)
     );
 
-    printf("Transmission complete.\n");
-
-    closesocket(clientSocket);
-    WSACleanup();
-
+    close(clientSocket);
     return 0;
 }

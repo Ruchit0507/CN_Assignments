@@ -1,69 +1,95 @@
 #include <stdio.h>
-#include <winsock2.h>
-#include <windows.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
-#pragma comment(lib, "ws2_32.lib")
+#define MAX_MSG_SIZE 100
+#define ACK "OK"
 
-#define PORT 8080
+int stringLength(char str[])
+{
+    int length = 0;
+
+    while (str[length] != '\0')
+        length++;
+
+    return length;
+}
+
+void clearMemory(void *address, int size)
+{
+    char *bytes = (char *)address;
+
+    for (int i = 0; i < size; i++)
+        bytes[i] = 0;
+}
 
 int main()
 {
-    WSADATA wsa;
-    SOCKET serverSocket;
-    struct sockaddr_in server, client;
-    int clientLen = sizeof(client);
-    int frame;
+    int serverSocket, clientSocket;
+    struct sockaddr_in serverAddress;
 
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-
-    serverSocket = socket(AF_INET, SOCK_DGRAM, 0);
-
-    server.sin_family = AF_INET;
-    server.sin_addr.s_addr = INADDR_ANY;
-    server.sin_port = htons(PORT);
-
-    bind(serverSocket, (struct sockaddr *)&server, sizeof(server));
-
-    printf("=================================\n");
-    printf("       STOP-AND-WAIT SERVER\n");
-    printf("=================================\n");
-    printf("Waiting for frames...\n\n");
-
-    while (1)
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0)
     {
-        recvfrom(
-            serverSocket,
-            (char *)&frame,
-            sizeof(frame),
-            0,
-            (struct sockaddr *)&client,
-            &clientLen
-        );
-
-        if (frame == -1)
-        {
-            printf("Transmission completed.\n");
-            break;
-        }
-
-        printf("Frame %d received\n", frame);
-
-        Sleep(1000);
-
-        sendto(
-            serverSocket,
-            (char *)&frame,
-            sizeof(frame),
-            0,
-            (struct sockaddr *)&client,
-            clientLen
-        );
-
-        printf("ACK %d sent\n\n", frame);
+        perror("Socket creation failed");
+        return 1;
     }
 
-    closesocket(serverSocket);
-    WSACleanup();
+    clearMemory(&serverAddress, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(9000);
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(serverSocket, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) < 0)
+    {
+        perror("Binding failed");
+        close(serverSocket);
+        return 1;
+    }
+
+    printf("Binding successful\n");
+
+    if (listen(serverSocket, 3) < 0)
+    {
+        perror("Listen failed");
+        close(serverSocket);
+        return 1;
+    }
+
+    printf("Waiting for client connection...\n");
+
+    clientSocket = accept(serverSocket, NULL, NULL);
+    if (clientSocket < 0)
+    {
+        perror("Accept failed");
+        close(serverSocket);
+        return 1;
+    }
+
+    printf("Client connected successfully.\n");
+
+    int n;
+    int r = recv(clientSocket,&n,sizeof(n),0);
+    if (r < 0)
+    {
+        printf("Error didn't received number of frames.");
+        return 0;
+    }
+    char ack[]="OK";
+    for (int i=0; i<n; i++)
+    {
+        char msg[MAX_MSG_SIZE];
+        int r = recv(clientSocket, msg, sizeof(msg) - 1, 0);
+        msg[r]='\0';
+        printf("%s",msg);
+
+        send(clientSocket,ack,stringLength(ack)+1,0);
+    }
+
+    close(clientSocket);
+    close(serverSocket);
 
     return 0;
 }
